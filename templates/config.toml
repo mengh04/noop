@@ -45,6 +45,9 @@ permission_mode = "bypassPermissions" # hard gates still apply via --disallowedT
 model = "claude-opus-5-5"
 [clis.codex]
 # model = "gpt-5.5-codex"
+[clis.agy]
+# model = "gemini-4-hydrogen-high"
+# permission_mode = "bypassPermissions" # bypassPermissions (--dangerously-skip-permissions) | auto | accept-edits
 
 [autonomy]
 level = "onboarding"                  # onboarding → assisted → autonomous. Only the owner changes this

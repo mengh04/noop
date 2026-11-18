@@ -25,7 +25,7 @@ import { medic } from "./medic";
 import { githubStarved } from "./github";
 import { doctor, visual } from "./visual";
 import { ackInbound, answerFromChat, appendEvent, cancelTask, feed, handleOwnerMessage, mediaDays, pendingInbound, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
-import { addFollowUp, reopenTask, routeWithoutModel, type BrainOut, ClaudeModel, systemPrompt, dataActs, localStore, logBrain, think } from "./brain";
+import { AgyModel, addFollowUp, reopenTask, routeWithoutModel, type BrainOut, ClaudeModel, systemPrompt, dataActs, localStore, logBrain, think } from "./brain";
 import { isWrite, runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { adoptCloudUrl, readHubToml } from "./sync";
@@ -771,7 +771,7 @@ export async function tick(cfg: Cfg, background = false) {
     const s = sample(cfg);
     const max = allowedParallel(s, cfg, running);
     if (running >= max) break;
-    if (!pickAccount(cfg, ["claude", "codex"].filter((c) => Bun.which(c)))) break;
+    if (!pickAccount(cfg, ["claude", "codex", "agy"].filter((c) => Bun.which(c)))) break;
     if ((await githubStarved(cfg)).starved && list(P("tasks", "inbox"), /^T-.*\.md$/).every((p) => GH_HEAVY.has(readDoc(p).meta.agent))) break;
     const t = pickTask(cfg, pressureOf(s), canRunHeavy(s, cfg, running));
     if (!t) break;
@@ -817,7 +817,7 @@ For each task decide:
 - channels: zero to three slugs from the channel goals below, or {"name":"...","goal":"..."} for a new work topic.
 - requires: host capabilities it truly needs, comma-separated, from the hosts' caps below (e.g. "os:macos" for iOS/macOS builds,
   simulators or screenshots; "os:windows"; "" when any host will do). Only require what the work cannot be done without.
-- cli: "claude" for engineering, debugging, design, UI or judgement; "codex" for routine triage, monitoring, reports, first-pass reviews.
+- cli: "claude" or "agy" for engineering, debugging, design, UI or judgement; "codex" for routine triage, monitoring, reports, first-pass reviews.
   A suggestion only — never pick against an agent's fixed CLI below.
 - difficulty: "hard" or "normal".
 ${fixed.size ? `\nAgent CLI (the owner's setting — not yours to change):\n${[...fixed].map(([a, c]) => `- ${a}: fixed to ${c.join(" → ")} (leave cli out)`).join("\n")}\n` : ""}
@@ -841,7 +841,7 @@ Reply with exactly one fenced json block: {"<task id>": {"requires": "", "cli": 
       const req = [...new Set([...(t.meta.requires ?? "").split(","), ...String(v.requires ?? "").split(",")].map((x) => x.trim()).filter(Boolean))].join(",");
       const pinned = t.meta.cli && t.meta.cli !== "auto";
       const per = fixed.get(t.meta.agent || "lead");
-      const hint = v.cli === "codex" || v.cli === "claude" ? v.cli : "";
+      const hint = v.cli === "codex" || v.cli === "claude" || v.cli === "agy" ? v.cli : "";
       const channelSlugs = [...new Set([...(t.meta.channels ?? "").split(",").filter(Boolean), ...resolveChannels(v.channels)])].join(",");
       writeDoc(t.p, { ...readDoc(t.p).meta, channels: channelSlugs, requires: req,
         ...cliHintPatch(t.meta, per, v.cli),
@@ -975,8 +975,11 @@ async function daemon(cfg: Cfg) {
     },
   });
   setApplyOp((op) => runTool(store, op?.tool, op));
-  const model = new ClaudeModel(String(cfg.router?.model ?? "claude-haiku-5-5"), String(cfg.router?.cli ?? "claude"), (cfg.router?.timeout_seconds ?? 45) * 1000);
-  if (isPrimary(cfg, host) && Bun.which(String(cfg.router?.cli ?? "claude"))) model.warm(systemPrompt());
+  const routerCli = String(cfg.router?.cli ?? (Bun.which("claude") ? "claude" : Bun.which("agy") ? "agy" : "claude"));
+  const model = routerCli === "agy"
+    ? new AgyModel(String(cfg.router?.model ?? "gemini-3.8-flash-low"), "agy", (cfg.router?.timeout_seconds ?? 45) * 1000)
+    : new ClaudeModel(String(cfg.router?.model ?? "claude-haiku-5-5"), routerCli, (cfg.router?.timeout_seconds ?? 45) * 1000);
+  if (isPrimary(cfg, host) && Bun.which(routerCli)) model.warm(systemPrompt());
   if (isPrimary(cfg, host)) startServer(cfg, async (text, { reply, answered, sentAt, thread, channel }) => {
     const got = Date.now();
     const room = channel ? channels().find((c) => c.slug === channel) : undefined;
@@ -1099,7 +1102,7 @@ const HELP = `Noop — your own AI team
 
   noop daemon                 run forever (tick every host.tick_seconds)
   noop tick                   one cycle: pull → routines → replies → judge → run tasks → push
-  noop add "title" [-b body] [-a agent] [-r os:linux (hard)] [--prefer os:macos (soft)] [-w heavy] [--host name] [--repo ~/work/x] [-p high] [--cli claude|codex]
+  noop add "title" [-b body] [-a agent] [-r os:linux (hard)] [--prefer os:macos (soft)] [-w heavy] [--host name] [--repo ~/work/x] [-p high] [--cli claude|codex|agy]
   noop decide D-0001 "A"      answer a decision from the terminal
   noop status                 queue / decision / accounts / resources overview
   noop learn [--full] [--dry]  learn the CEO from local Claude/Codex sessions (digest stays local; principles go to memory)
@@ -1112,6 +1115,8 @@ const HELP = `Noop — your own AI team
   noop guest join <url> <code> · run · install · uninstall   low-trust guest worker for shared machines (no memory, no machine key)
   noop guest invite <label> · list · assign <G-id> <T-id> · results [--ack] · revoke <G-id>   (primary side)
   noop revoke-sessions        security valve: sign out every phone, browser and MCP connector at once (machines keep working)
+  noop cloud deploy           deploy the coordination hub to Cloudflare Workers
+  noop cloud serve [--port 8788] [--db path]  run the self-hosted coordination hub on this machine (no Cloudflare)
 `;
 
 async function main() {
@@ -1253,7 +1258,22 @@ async function main() {
       return void console.log(L(`✓ Revoked ${revoked} login(s) (phones, browsers, MCP connectors). Log in again with an email code.\n  If you suspect the mailbox is compromised, change its password first, then consider rotating the machine key.`, `✓ 已撤销 ${revoked} 个登录（手机、浏览器、MCP 连接器）。需要重新用邮箱验证码登录。\n  如果怀疑邮箱被盗，先改邮箱密码，再考虑轮换机器密钥。`));
     }
     case "cloud": {
-      if (rest[0] !== "deploy") return void console.log("usage: hub cloud deploy");
+      if (rest[0] === "serve") {
+        const { parseSelfHostArgs, startSelfHostServer } = await import("../cloud/src/selfhost");
+        const opts = parseSelfHostArgs(rest.slice(1));
+        const h = await startSelfHostServer({
+          ...(cfg.server?.token ? { token: cfg.server.token } : {}),
+          ...(cfg.owner?.language ? { lang: cfg.owner.language } : {}),
+          ...opts,
+        });
+        console.log(`noop self-hosted cloud listening on ${h.url}`);
+        return new Promise<void>((resolve) => {
+          const done = () => { h.stop(true); resolve(); };
+          process.once("SIGINT", done);
+          process.once("SIGTERM", done);
+        });
+      }
+      if (rest[0] !== "deploy") return void console.log("usage: hub cloud <deploy|serve>");
       return void (await cloudDeploy(cfg));
     }
     case "notify": return void console.log(await notify(rest.join(" "), cfg));

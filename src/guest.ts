@@ -10,6 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { GUEST_IDLE_MS } from "../cloud/src/budget";
+import { agyUserEvent, extractAgyStreamText } from "./runner";
 
 const HOME = () => process.env.NOOP_GUEST_HOME || join(homedir(), ".noop-guest");
 type GuestCfg = { url: string; id: string; token: string };
@@ -35,6 +36,7 @@ export function guestPrompt(t: { id: string; title: string; body: string; repo?:
  *  never load (they run shell commands), and the agent gets no shell or network so it can't reach other machines. */
 export function guestCommand(cli: string): string[] {
   if (cli === "codex") return ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=false", "-"];
+  if (cli === "agy") return ["agy", "-p=", "--input-format", "stream-json", "--output-format", "stream-json", "--sandbox", "--mode", "accept-edits", "--disable-slash-commands"];
   return ["claude", "-p", "--output-format", "text", "--permission-mode", "acceptEdits", "--setting-sources", "user", "--strict-mcp-config",
     "--disallowedTools", "Bash", "WebFetch", "WebSearch", "--"];
 }
@@ -59,10 +61,12 @@ async function runOne(c: GuestCfg, cli: string): Promise<boolean> {
       cwd = join(dir, "repo");
     }
     const cmd = guestCommand(cli);
-    const p = Bun.spawn(cmd, { cwd, stdin: new Blob([guestPrompt(t)]), stdout: "pipe", stderr: "pipe" });
+    const stdin = cli === "agy" ? agyUserEvent(guestPrompt(t)) : guestPrompt(t);
+    const p = Bun.spawn(cmd, { cwd, stdin: new Blob([stdin]), stdout: "pipe", stderr: "pipe" });
     const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
     ok = (await p.exited) === 0;
-    text = (out || err).slice(-200_000);
+    const parsedOut = cli === "agy" ? extractAgyStreamText(out) : out;
+    text = (parsedOut || err).slice(-200_000);
     if (t.repo) patch = Bun.spawnSync(["git", "diff"], { cwd }).stdout.toString().slice(0, 50_000);
   } catch (e) { text = String((e as Error).message ?? e); }
   finally { rmSync(dir, { recursive: true, force: true }); }
@@ -170,8 +174,8 @@ export async function guestCmd(rest: string[], loadCfg: () => any) {
   }
 }
 
-/** The guest runs tasks with this machine's own model login: claude when it is installed, else codex. */
-function defaultCli() { return Bun.which("claude") || !Bun.which("codex") ? "claude" : "codex"; }
+/** The guest runs tasks with this machine's own model login: claude when it is installed, else codex, else agy. */
+function defaultCli() { return ["claude", "codex", "agy"].find((c) => Bun.which(c)) ?? "claude"; }
 
 // ------------------------------------------------------------------ guest service
 // Per OS account, like the guest home: each person's guest starts at their own login and never needs admin rights.

@@ -23,7 +23,7 @@ test("without a member config the planner's hint decides", () => {
 });
 
 test("neither config nor hint: either CLI, Claude first", () => {
-  expect(allowedClis({ agent: "lead", cli: "auto" }, cfg())).toEqual(["claude", "codex"]);
+  expect(allowedClis({ agent: "lead", cli: "auto" }, cfg())).toEqual(["claude", "codex", "agy"]);
 });
 
 test("a member without its own config is unaffected by another member's", () => {
@@ -38,8 +38,14 @@ test("a malformed (non-array) member config is ignored instead of crashing", () 
   expect(allowedClis({ agent: "lead", cli: "auto", cli_hint: "codex" }, cfg({ lead: "codex" }))).toEqual(["codex"]);
 });
 
-test("a hint outside {claude, codex} is ignored rather than pinned", () => {
-  expect(allowedClis({ agent: "lead", cli: "auto", cli_hint: "gpt" }, cfg())).toEqual(["claude", "codex"]);
+test("a hint outside {claude, codex, agy} is ignored rather than pinned", () => {
+  expect(allowedClis({ agent: "lead", cli: "auto", cli_hint: "gpt" }, cfg())).toEqual(["claude", "codex", "agy"]);
+});
+
+test("agy hint and per-member policy work like claude and codex", () => {
+  expect(allowedClis({ agent: "lead", cli: "auto", cli_hint: "agy" }, cfg())).toEqual(["agy"]);
+  expect(allowedClis({ agent: "lead", cli: "auto", cli_hint: "agy" }, cfg({ lead: ["codex"] }))).toEqual(["codex"]);
+  expect(cliHintPatch({ agent: "lead", cli: "auto" }, undefined, "agy")).toEqual({ cli_hint: "agy" });
 });
 
 test("a member's configured order is kept", () => {

@@ -299,7 +299,7 @@ export function settingsView() {
       max_parallel: cfg.host?.max_parallel ?? null,
       media_days: mediaDays(cfg),
     },
-    options: { clis: [["claude"], ["codex", "claude"], ["claude", "codex"], ["codex"]], autonomy: ["onboarding", "assisted", "autonomous"] },
+    options: { clis: [["claude"], ["codex", "claude"], ["claude", "codex"], ["codex"], ["agy"], ["agy", "claude"], ["claude", "agy"], ["agy", "codex"], ["codex", "agy"]], autonomy: ["onboarding", "assisted", "autonomous"] },
   };
 }
 

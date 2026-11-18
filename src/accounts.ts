@@ -60,6 +60,7 @@ export function codexGatewayAuth(dir: string): string | null {
 }
 
 function usesGateway(a: Account): boolean {
+  if (a.cli === "agy") return false;
   const dir = a.default ? join(homedir(), a.cli === "claude" ? ".claude" : ".codex") : a.dir;
   if (a.cli === "claude") return !!gatewayAuth(dir);
   if (a.cli === "codex") return !!codexGatewayAuth(dir);
@@ -68,6 +69,10 @@ function usesGateway(a: Account): boolean {
 
 /** When the CLI's login was last written: a new login (another account) changes it. */
 function credStamp(a: Account): number {
+  if (a.cli === "agy") {
+    const f = join(homedir(), ".gemini", "google_accounts.json");
+    try { return statSync(f).mtimeMs; } catch { return 0; }
+  }
   const dir = a.default ? join(homedir(), a.cli === "claude" ? ".claude" : ".codex") : a.dir;
   const f = join(dir, a.cli === "claude" ? ".credentials.json" : "auth.json");
   try { return statSync(f).mtimeMs; } catch { return 0; }
@@ -98,15 +103,22 @@ export function pickAccount(cfg: Cfg, clis: string[]): Account | null {
   return null;
 }
 
-const OTHER_CLI: Record<string, string> = { claude: "codex", codex: "claude" };
+const ALL_CLIS = ["claude", "codex", "agy"] as const;
+const cliDisplayName = (cli: string) => (cli === "claude" ? "Claude" : cli === "codex" ? "Codex" : cli === "agy" ? "AGY" : cli);
+const cliLoginHint = (cli: string) => (cli === "claude" ? "claude /login" : cli === "codex" ? "codex login" : cli === "agy" ? "agy" : cli);
+const OTHER_CLIS: Record<string, string[]> = {
+  claude: ["codex", "agy"],
+  codex: ["claude", "agy"],
+  agy: ["claude", "codex"],
+};
 
 /** After `failed` hit a quota/login wall (or nothing in `wanted` is usable when failed is null):
- *  another usable account of the same CLI first, else the other CLI (codex <-> claude) — for any agent. */
+ *  another usable account of the same CLI first, else another installed CLI — for any agent. */
 export function failoverAccount(cfg: Cfg, failed: Account | null, wanted: string[], installed: (cli: string) => boolean = (c) => !!Bun.which(c)): Account | null {
   const same = failed ? [failed.cli] : wanted;
   const first = same.filter(installed);
   for (const cli of first) for (const a of accounts(cfg, cli)) if (usable(a) && !(failed && key(a) === key(failed))) return a;
-  const others = [...new Set(same.map((c) => OTHER_CLI[c]).filter((c) => c && !first.includes(c) && installed(c)))];
+  const others = [...new Set(same.flatMap((c) => OTHER_CLIS[c] ?? []).filter((c) => !first.includes(c) && installed(c)))];
   return pickAccount(cfg, others);
 }
 
@@ -127,8 +139,8 @@ export function accountEnv(a: Account): Record<string, string> {
 // "try again at/in <time>" is a quota reset hint. A vague "try again in a moment" is what a gateway 5xx says
 // ("a server-side issue, usually temporary"): counting it as quota put the account on a one-hour cooldown
 // and moved all its work to the other CLI over a blip.
-const QUOTA = /usage limit|rate[ -]?limit|limit reached|quota|credit balance is too low|no credits remaining|insufficient credits|purchase more credits|\b402\b|add credits to continue|too many requests|\b429\b|overloaded|hit your .*limit|try again (at|in)(?! (?:a|a few|some) (?:moments?|bit|while|seconds?|minutes?)\b)/i;
-const AUTH = /not logged in|please run \/login|invalid api key|authentication[_ ]error|\b401\b|oauth (token|session) (has )?expired|login required|unauthorized|codex login/i;
+const QUOTA = /usage limit|rate[ -]?limit|limit reached|quota|resource[_ ]exhausted|credit balance is too low|no credits remaining|insufficient credits|purchase more credits|\b402\b|add credits to continue|too many requests|\b429\b|overloaded|hit your .*limit|try again (at|in)(?! (?:a|a few|some) (?:moments?|bit|while|seconds?|minutes?)\b)/i;
+const AUTH = /not logged in|not authenticated|authentication failed|please run \/login|invalid api key|authentication[_ ]error|\b401\b|oauth (token|session) (has )?expired|login required|unauthorized|codex login/i;
 
 export type Failure = "quota" | "auth" | null;
 
@@ -172,11 +184,12 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
     journal(host, `${key(a)} hit usage limit → cooldown until ${st.cooldown_until.slice(11, 16)}Z`);
     if (st.told !== st.cooldown_until) {
       st.told = st.cooldown_until;
-      const others = (cfg.clis?.preference ?? ["claude", "codex"]).filter((c: string) => c !== a.cli && Bun.which(c) && accounts(cfg, c).some(usable));
+      const others = (cfg.clis?.preference ?? [...ALL_CLIS]).filter((c: string) => c !== a.cli && Bun.which(c) && accounts(cfg, c).some(usable));
       const at = new Date(st.cooldown_until).toLocaleTimeString(L("en-US", "zh-CN"), { hour: "2-digit", minute: "2-digit" });
-      void notify([L(`${a.cli === "claude" ? "Claude" : "Codex"} (${host}) is out of quota, back around ${at}.`, `${a.cli === "claude" ? "Claude" : "Codex"}（${host}）额度用完了，约 ${at} 恢复。`),
+      const label = cliDisplayName(a.cli), loginCmd = cliLoginHint(a.cli);
+      void notify([L(`${label} (${host}) is out of quota, back around ${at}.`, `${label}（${host}）额度用完了，约 ${at} 恢复。`),
         others.length ? L(`Until then tasks go to ${others.join(", ")}.`, `这期间任务先交给 ${others.join("、")} 做。`) : L("No AI is available until then, tasks will queue.", "这期间没有可用的 AI，任务会排队等着。"),
-        L(`To recover now: run ${a.cli === "claude" ? "claude /login" : "codex login"} on this machine to switch account; it is picked up automatically.`, `想马上恢复：在这台机器上运行 ${a.cli === "claude" ? "claude /login" : "codex login"} 换个账号，登录后会自动接着用，不用等。`)].join("\n"),
+        L(`To recover now: run ${loginCmd} on this machine to switch account; it is picked up automatically.`, `想马上恢复：在这台机器上运行 ${loginCmd} 换个账号，登录后会自动接着用，不用等。`)].join("\n"),
         cfg, { kind: "notice" });
     }
   } else if (gateway) {
@@ -191,20 +204,30 @@ export async function reportFailure(a: Account, kind: Failure, output: string, c
       journal(host, `${key(a)} gateway auth failed → cooldown 1h (no OAuth login for gateway accounts)`);
       const other = a.cli === "claude" ? "Codex" : "Claude";
       const where = a.cli === "claude" ? "~/.claude/settings.json (ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN)" : "~/.codex/config.toml ([model_providers.*]: experimental_bearer_token / env_key / base_url)";
-      void notify([L(`${a.cli === "claude" ? "Claude" : "Codex"} (${host}) authenticates through an API gateway and the gateway rejected the token. Tasks go to ${other} for now. No login link will be sent: replace the token in ${where}.`,
-        `${a.cli === "claude" ? "Claude" : "Codex"}（${host}）使用 API 网关鉴权，网关拒绝了令牌，任务暂时交给 ${other}。这里不适用 OAuth 登录，不会再发登录链接；请更换 ${where} 里的令牌。`)].join("\n"), cfg, { kind: "notice" });
+      void notify([L(`${cliDisplayName(a.cli)} (${host}) authenticates through an API gateway and the gateway rejected the token. Tasks go to ${other} for now. No login link will be sent: replace the token in ${where}.`,
+        `${cliDisplayName(a.cli)}（${host}）使用 API 网关鉴权，网关拒绝了令牌，任务暂时交给 ${other}。这里不适用 OAuth 登录，不会再发登录链接；请更换 ${where} 里的令牌。`)].join("\n"), cfg, { kind: "notice" });
+    }
+  } else if (a.cli === "agy") {
+    // AGY uses browser/OS-keyring Google sign-in and has no headless device-auth code flow.
+    st.needs_login = true;
+    const day = new Date().toISOString().slice(0, 10);
+    if (st.told !== `agy-auth:${day}`) {
+      st.told = `agy-auth:${day}`;
+      journal(host, `🔑 ${key(a)} needs Google sign-in`);
+      void notify(L(`🔑 AGY on ${host} needs to sign in again. Run \`agy\` on ${host} to complete Google sign-in.`,
+        `🔑 ${host} 上的 AGY 需要重新登录。请到 ${host} 上运行 \`agy\` 完成 Google 登录。`), cfg, { kind: "notice" });
     }
   } else {
     st.needs_login = true;
     journal(host, `🔑 ${key(a)} needs login`);
   }
   save(s);
-  if (kind === "auth" && !gateway) await startLogin(a, cfg);
+  if (kind === "auth" && !gateway && a.cli !== "agy") await startLogin(a, cfg);
   await alertIfAllExhausted(cfg);
 }
 
 async function alertIfAllExhausted(cfg: Cfg) {
-  const clis: string[] = cfg.clis?.preference ?? ["claude", "codex"];
+  const clis: string[] = cfg.clis?.preference ?? [...ALL_CLIS];
   const installed = clis.filter((c) => Bun.which(c));
   if (pickAccount(cfg, installed)) return;
   const s = load();
@@ -325,7 +348,7 @@ export async function retryLogins(cfg: Cfg) {
 /** Structured account states for this machine (the app's machine page). */
 export function accountsInfo(cfg: Cfg): { cli: string; name: string; state: "ok" | "cooldown" | "login"; until?: string }[] {
   const s = load();
-  return ["claude", "codex"].filter((c) => Bun.which(c)).flatMap((c) => accounts(cfg, c)).map((a) => {
+  return ALL_CLIS.filter((c) => Bun.which(c)).flatMap((c) => accounts(cfg, c)).map((a) => {
     const st = s.accounts[key(a)] ?? {};
     const cool = !!st.cooldown_until && Date.parse(st.cooldown_until) > Date.now();
     return { cli: a.cli, name: a.name, state: st.needs_login ? "login" : cool ? "cooldown" : "ok", until: cool ? st.cooldown_until : undefined };
@@ -334,7 +357,7 @@ export function accountsInfo(cfg: Cfg): { cli: string; name: string; state: "ok"
 
 export function accountsStatus(cfg: Cfg): string[] {
   const s = load();
-  return ["claude", "codex"].filter((c) => Bun.which(c)).flatMap((c) => accounts(cfg, c)).map((a) => {
+  return ALL_CLIS.filter((c) => Bun.which(c)).flatMap((c) => accounts(cfg, c)).map((a) => {
     const st = s.accounts[key(a)] ?? {};
     const state = st.needs_login ? "needs login" : st.cooldown_until && Date.parse(st.cooldown_until) > Date.now()
       ? `cooldown → ${new Date(st.cooldown_until).toLocaleTimeString()}` : "ok";

@@ -142,7 +142,7 @@ hub visual stop <name>`);
 }
 
 export async function doctor() {
-  const need: [string, string][] = [["git", "core"], ["bun", "core"], ["gh", "GitHub"], ["claude", "agent"], ["codex", "agent"]];
+  const need: [string, string][] = [["git", "core"], ["bun", "core"], ["gh", "GitHub"], ["claude", "agent"], ["codex", "agent"], ["agy", "agent"]];
   if (process.platform === "linux") need.push(["sway", "visual (GPU headless)"], ["wf-recorder", "visual recording (sway)"], ["grim", "visual screenshot (sway)"],
     ["wtype", "visual input (sway)"], ["Xvfb", "visual fallback"], ["ffmpeg", "visual fallback/recording"], ["xdotool", "visual input (Xvfb)"], ["script", "headless login"]);
   const missing: string[] = [];
@@ -153,5 +153,5 @@ export async function doctor() {
   }
   console.log(`visual backend: ${backendFor()}`);
   if (missing.length && process.platform === "linux" && Bun.which("pacman"))
-    console.log(`\ninstall:  sudo pacman -S --needed ${missing.filter((m) => !["claude", "codex", "bun"].includes(m)).map((m) => m === "Xvfb" ? "xorg-server-xvfb" : m === "script" ? "util-linux" : m === "gh" ? "github-cli" : m).join(" ")}`);
+    console.log(`\ninstall:  sudo pacman -S --needed ${missing.filter((m) => !["claude", "codex", "agy", "bun"].includes(m)).map((m) => m === "Xvfb" ? "xorg-server-xvfb" : m === "script" ? "util-linux" : m === "gh" ? "github-cli" : m).join(" ")}`);
 }

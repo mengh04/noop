@@ -173,6 +173,64 @@ export class ClaudeModel implements Model {
   }
 }
 
+/** `agy -p=` in stream-json mode, spawned ahead of time so owner chat turns reuse a warm process. */
+export class AgyModel implements Model {
+  private next: ReturnType<typeof Bun.spawn> | null = null;
+  constructor(private model = "gemini-3.8-flash-low", private cli = "agy", private timeoutMs = 45_000) {}
+  private spawn() {
+    mkdirSync(BRAIN_DIR, { recursive: true });
+    const cmd = [this.cli, "-p=", "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
+      ...(this.model ? ["--model", this.model] : [])];
+    return Bun.spawn(cmd, { cwd: BRAIN_DIR, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+  }
+  warm(_system?: string) {
+    if (!this.next || this.next.exitCode !== null) {
+      this.next?.kill();
+      this.next = this.spawn();
+    }
+  }
+  async open(system: string) {
+    this.warm();
+    const proc = this.next!;
+    this.next = null;
+    setTimeout(() => this.warm(), 0);
+    const stdin = proc.stdin as import("bun").FileSink;
+    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+    const dec = new TextDecoder();
+    let buf = "", first = true;
+    const nextResult = async (): Promise<string> => {
+      for (;;) {
+        const nl = buf.indexOf("\n");
+        if (nl >= 0) {
+          const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+          let m: any; try { m = JSON.parse(line); } catch { continue; }
+          if (m.event === "result") {
+            if (m.result?.status === "ERROR") throw new Error(String(m.result?.error ?? "agy error"));
+            return String(m.result?.response ?? "");
+          }
+          continue;
+        }
+        const { value, done } = await reader.read();
+        if (done) throw new Error("model process ended");
+        buf += dec.decode(value, { stream: true });
+      }
+    };
+    return {
+      send: async (text: string) => {
+        const content = first && system.trim() ? `<system>\n${system}\n</system>\n\n${text}` : text;
+        first = false;
+        stdin.write(JSON.stringify({ event: "user", message: { role: "user", content } }) + "\n");
+        stdin.flush();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          return await Promise.race([nextResult(), new Promise<string>((_, rej) => { timer = setTimeout(() => rej(new Error("model timeout")), this.timeoutMs); })]);
+        } finally { clearTimeout(timer); }
+      },
+      close: () => { try { stdin.end(); } catch {} proc.kill(); },
+    };
+  }
+}
+
 // ---------------------------------------------------------------- the brain
 
 const BRAIN_TOOLS = toolsFor("brain");

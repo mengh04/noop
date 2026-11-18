@@ -176,16 +176,60 @@ export function cliCommand(cli: string, cfg: Cfg, gateOverride = false, mcpArgs:
     cmd.push(...mcpArgs);
     return [...cmd, "-"];
   }
+  if (cli === "agy") {
+    const cmd = ["agy", "-p=", "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands"];
+    if (c.permission_mode && c.permission_mode !== "bypassPermissions") cmd.push("--mode", c.permission_mode);
+    else cmd.push("--dangerously-skip-permissions");
+    for (const dir of codexWritableDirs(homedir(), cfg.resources?.work_dirs)) cmd.push("--add-dir", dir);
+    if (c.model) cmd.push("--model", c.model);
+    if (c.effort) cmd.push("--effort", c.effort);
+    cmd.push(...mcpArgs);
+    return cmd;
+  }
   throw new Error(`unknown cli ${cli}`);
 }
 
-/** The model a CLI is started with: an explicit `--model`/`-m`, else Codex's own config default. */
-export function startModel(cli: string, cmd: string[], codexHome?: string): string | undefined {
+/** The model a CLI is started with: an explicit `--model`/`-m`, else Codex/AGY's own config default. */
+export function startModel(cli: string, cmd: string[], codexHome?: string, agyHome?: string): string | undefined {
   codexHome ??= process.env.CODEX_HOME ?? join(homedir(), ".codex");
+  agyHome ??= join(homedir(), ".gemini", "antigravity-cli");
   const i = cmd.findIndex((c) => c === "--model" || c === "-m");
   if (i >= 0 && cmd[i + 1]) return cmd[i + 1];
   if (cli === "codex") return readIf(join(codexHome, "config.toml"), 100000).match(/^\s*model\s*=\s*"([^"]+)"/m)?.[1];
+  if (cli === "agy") {
+    try {
+      const m = JSON.parse(readIf(join(agyHome, "settings.json"), 100000) || "{}")?.model;
+      if (typeof m === "string" && m.trim()) return m.trim();
+    } catch {}
+  }
   return undefined;
+}
+
+/** Encode one user turn for `agy --input-format stream-json`. */
+export const agyUserEvent = (prompt: string) =>
+  JSON.stringify({ event: "user", message: { role: "user", content: prompt } }) + "\n";
+
+/** Extract the final text from `agy --output-format stream-json` NDJSON output. */
+export function extractAgyStreamText(raw: string): string {
+  let resultText: string | undefined, assistantText = "";
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let e: any;
+    try { e = JSON.parse(line); } catch { continue; }
+    if (e.event === "step_update" && e.step_update?.step_type === "agent_response" && typeof e.step_update.text_delta === "string") {
+      assistantText += e.step_update.text_delta;
+    } else if (e.event === "result" && e.result) {
+      const t = typeof e.result.response === "string" ? e.result.response : "";
+      if (t) resultText = resultText === undefined ? t : `${resultText}\n\n${t}`;
+      else if (e.result.status === "ERROR" && typeof e.result.error === "string" && !resultText) resultText = e.result.error;
+    }
+  }
+  return resultText ?? (assistantText || raw);
+}
+
+function usesStreamInput(cmd: string[]): boolean {
+  const i = cmd.indexOf("--input-format");
+  return i >= 0 && cmd[i + 1] === "stream-json";
 }
 
 /** Running agent processes by task id (so the owner can cancel one). */
@@ -194,7 +238,7 @@ export const agentProcs = new Map<string, { kill: (sig?: number | NodeJS.Signals
 /** One line saying what a tool call does ("gh pr checks 814 -R longbridge/nsh", "读 src/cli.ts"), for "最近在做". */
 function toolStep(name: string, input: any): string {
   const i = input ?? {};
-  const v = i.description || i.command || i.file_path || i.path || i.pattern || i.url || i.query || i.prompt || "";
+  const v = i.description || i.command || i.CommandLine || i.file_path || i.TargetFile || i.AbsolutePath || i.path || i.Path || i.DirectoryPath || i.SearchPath || i.pattern || i.url || i.Url || i.query || i.Query || i.prompt || i.Prompt || "";
   return `${name}${v ? ` · ${String(v).split("\n")[0].slice(0, 120)}` : ""}`;
 }
 
@@ -228,7 +272,7 @@ export const RUN_LIMIT = "\n[run-limit]";
  *  go on the command line: Claude reads a private 0600 file that is removed when the run ends, Codex gets them in its
  *  environment through its env indirections. */
 export async function mcpLaunch(cli: string, cfg: Cfg, secrets?: Record<string, string>): Promise<{ args: string[]; env: Record<string, string>; file?: string }> {
-  if (Array.isArray(cfg.clis?.[cli]?.command)) return { args: [], env: {} };
+  if (Array.isArray(cfg.clis?.[cli]?.command) || cli === "agy") return { args: [], env: {} };
   const env = { ...process.env, ...(secrets ?? await sharedSecrets(cfg)) };
   const list = sharedMcp(cfg, env);
   if (!list.length) return { args: [], env: {} };
@@ -252,8 +296,9 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   const dir = cwd.replace(/^~/, homedir());
   // before the spawn: a throw after it would leave the agent running with no timeout, stall watch or drained pipes
   mkdirSync(P("logs", "runs"), { recursive: true });
+  const stdinText = usesStreamInput(cmd) ? agyUserEvent(prompt) : prompt;
   const proc = Bun.spawn(cmd, {
-    cwd: existsSync(dir) ? dir : ROOT, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe",
+    cwd: existsSync(dir) ? dir : ROOT, stdin: new Blob([stdinText]), stdout: "pipe", stderr: "pipe",
     // Claude -p stops background subagents 10 min after the last turn; our own run limit bounds the run instead
     env: { ...process.env, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: "0", ...mcp.env, ...extraEnv, HUB_DATA: ROOT },
   });
@@ -275,6 +320,29 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   const onLine = (line: string) => {
     let e: any;
     try { e = JSON.parse(line); } catch { return; }
+    if (e.event === "init" && e.init?.model) act.model = String(e.init.model);
+    if (e.event === "step_update" && e.step_update) {
+      const su = e.step_update;
+      if (su.step_type === "tool") {
+        const id = String(su.step_index ?? ""), tname = String(su.tool_name ?? su.tool_info?.name ?? "tool");
+        if (su.state === "ACTIVE") {
+          if (!inFlight.has(id)) act.steps++;
+          inFlight.set(id, tname);
+          act.step = toolStep(tname, su.tool_info?.parameters);
+        } else {
+          inFlight.delete(id);
+        }
+      } else if (su.step_type === "agent_response" && typeof su.text_delta === "string") {
+        assistantText += su.text_delta;
+      }
+      return;
+    }
+    if (e.event === "result" && e.result) {
+      const text = typeof e.result.response === "string" ? e.result.response
+        : (e.result.status === "ERROR" && typeof e.result.error === "string" ? e.result.error : "");
+      if (text) resultText = resultText === undefined ? text : `${resultText}\n\n${text}`;
+      return;
+    }
     if (e.type === "system" && e.subtype === "init" && e.model) act.model = String(e.model);
     if (e.type === "assistant") {
       if (e.message?.model && !e.parent_tool_use_id) act.model = String(e.message.model);
@@ -321,7 +389,7 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   const timer = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
   // a run that has gone quiet: no output at all, and nothing slow in flight (a sub-agent may work quietly for long)
   const watch = setInterval(() => {
-    const slow = [...inFlight.values()].some((n) => /^(Task|Agent)$/.test(n));
+    const slow = [...inFlight.values()].some((n) => /^(Task|Agent|invoke_subagent|run_workflow|browser_subagent)$/.test(n));
     if (!slow && Date.now() - act.at > stallMs) { stalled = true; proc.kill(); }
   }, 30_000);
   const [raw, err] = await Promise.all([read(proc.stdout, json, true), read(proc.stderr, false)]);
@@ -410,21 +478,44 @@ function repairJson(json: string): string {
 
 /** The models that route each owner message, fastest first: a choice made within seconds, not a judgement.
  * `[router] cli/model` in config.toml puts one first; the others are fallbacks when its CLI is missing or fails. */
-const ROUTERS = [{ cli: "claude", model: "claude-haiku-5-5" }, { cli: "codex", model: "gpt-6-luna" }];
+const ROUTERS = [
+  { cli: "claude", model: "claude-haiku-5-5" },
+  { cli: "codex", model: "gpt-6-luna" },
+  { cli: "agy", model: "gemini-3.8-flash-low" },
+];
+
+function oneShotCmd(cli: string, model: string | undefined, mode: "router" | "judge"): { cmd: string[]; stdin: string; streamJson: boolean } {
+  if (cli === "agy") {
+    return {
+      cmd: ["agy", "-p=", "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands", ...(model ? ["--model", model] : [])],
+      stdin: agyUserEvent(mode), // placeholder; caller passes actual prompt
+      streamJson: true,
+    };
+  }
+  if (cli === "codex") {
+    const cmd = mode === "router"
+      ? ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", ...(model ? ["-m", model] : []), "-c", 'model_reasoning_effort="low"', "-"]
+      : ["codex", "exec", "--skip-git-repo-check", ...(model ? ["-m", model] : []), "-"];
+    return { cmd, stdin: "", streamJson: false };
+  }
+  const cmd = mode === "router"
+    ? ["claude", "-p", "--output-format", "text", "--tools", "", "--strict-mcp-config", ...(model ? ["--model", model] : [])]
+    : ["claude", "-p", "--output-format", "text", "--model", model ?? "claude-opus-5-5", "--tools", ""];
+  return { cmd, stdin: "", streamJson: false };
+}
 
 /** One quick structured call for routing (the fastest model available); null when none answered. */
 export async function quickAsk(prompt: string, cfg: Cfg, logFile: string): Promise<any> {
   const own = cfg.router?.cli ? [{ cli: String(cfg.router.cli), model: String(cfg.router.model ?? "") }] : [];
   for (const r of [...own, ...ROUTERS.filter((x) => x.cli !== own[0]?.cli)]) {
     if (!Bun.which(r.cli)) continue;
-    const cmd = r.cli === "claude"
-      ? ["claude", "-p", "--output-format", "text", "--tools", "", "--strict-mcp-config", ...(r.model ? ["--model", r.model] : [])]
-      : ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", ...(r.model ? ["-m", r.model] : []), "-c", 'model_reasoning_effort="low"', "-"];
-    const proc = Bun.spawn(cmd, { cwd: ROOT, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" });
+    const spec = oneShotCmd(r.cli, r.model || undefined, "router");
+    const proc = Bun.spawn(spec.cmd, { cwd: ROOT, stdin: new Blob([spec.streamJson ? agyUserEvent(prompt) : prompt]), stdout: "pipe", stderr: "pipe" });
     const timer = setTimeout(() => proc.kill("SIGKILL"), (cfg.router?.timeout_seconds ?? 45) * 1000);
-    const out = await new Response(proc.stdout).text();
+    const raw = await new Response(proc.stdout).text();
     await proc.exited;
     clearTimeout(timer);
+    const out = spec.streamJson ? extractAgyStreamText(raw) : raw;
     mkdirSync(P("logs", "runs"), { recursive: true });
     writeFileSync(logFile, `${r.cli} ${r.model}\n${out}`);
     const m = [...out.matchAll(/```json\s*(\{[\s\S]*?\})\s*```/g)].pop() ?? out.match(/(\{[\s\S]*\})/);
@@ -435,15 +526,14 @@ export async function quickAsk(prompt: string, cfg: Cfg, logFile: string): Promi
 
 /** One-shot structured call (used by the judge). */
 export async function ask(prompt: string, cfg: Cfg, logFile: string): Promise<any> {
-  const cli = cfg.judge?.cli ?? "claude";
-  const cmd = cli === "claude"
-    ? ["claude", "-p", "--output-format", "text", "--model", cfg.judge?.model ?? "claude-opus-5-5", "--tools", ""]
-    : ["codex", "exec", "--skip-git-repo-check", "-"];
-  const proc = Bun.spawn(cmd, { cwd: ROOT, stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe" });
+  const cli = cfg.judge?.cli ?? (["claude", "codex", "agy"].find((c) => Bun.which(c)) ?? "claude");
+  const spec = oneShotCmd(cli, cfg.judge?.model, "judge");
+  const proc = Bun.spawn(spec.cmd, { cwd: ROOT, stdin: new Blob([spec.streamJson ? agyUserEvent(prompt) : prompt]), stdout: "pipe", stderr: "pipe" });
   const timer = setTimeout(() => proc.kill("SIGKILL"), (cfg.judge?.timeout_minutes ?? 10) * 60_000); // runs inside locked()
-  const out = await new Response(proc.stdout).text();
+  const raw = await new Response(proc.stdout).text();
   await proc.exited;
   clearTimeout(timer);
+  const out = spec.streamJson ? extractAgyStreamText(raw) : raw;
   mkdirSync(P("logs", "runs"), { recursive: true });
   writeFileSync(logFile, out);
   const m = [...out.matchAll(/```json\s*(\{[\s\S]*?\})\s*```/g)].pop() ?? out.match(/(\{[\s\S]*\})/);

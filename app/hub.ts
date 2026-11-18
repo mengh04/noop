@@ -299,6 +299,11 @@ const CLI_LABELS = (): Record<string, string> => ({
   "codex,claude": "Codex → Claude",
   "claude,codex": "Claude → Codex",
   codex: L("Codex only", "仅 Codex"),
+  agy: L("AGY only", "仅 AGY"),
+  "agy,claude": "AGY → Claude",
+  "claude,agy": "Claude → AGY",
+  "agy,codex": "AGY → Codex",
+  "codex,agy": "Codex → AGY",
 });
 export const cliKey = (clis: string[]) => clis.join(",");
 export const cliLabel = (clis: string[]) => CLI_LABELS()[cliKey(clis)] ?? clis.join(" → ");

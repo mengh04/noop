@@ -111,7 +111,7 @@ async function getTransport(): Promise<Transport | null> {
 /** The shared config names a different Worker (the hub moved, e.g. to another account): switch this machine to it. */
 export function adoptCloudUrl(url: unknown): boolean {
   const next = String(url ?? "").replace(/\/$/, "");
-  if (!/^https:\/\//.test(next) || process.env.HUB_SYNC_FAKE || process.env.HUB_SYNC === "local") return false;
+  if (!/^https?:\/\//.test(next) || process.env.HUB_SYNC_FAKE || process.env.HUB_SYNC === "local") return false;
   const cur = String(readHubToml().cloud?.url ?? "").replace(/\/$/, "");
   if (!cur || cur === next) return false;
   writeHubToml({ cloud: { url: next } });

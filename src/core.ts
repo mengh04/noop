@@ -186,7 +186,7 @@ export type TaskOpts = {
 /** Capabilities of this machine: os:<linux|macos|windows>, host:<name>, plus config [host].caps (e.g. gpu, docker, home). */
 export function hostCaps(cfg: Cfg): string[] {
   const os = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
-  const clis = ["claude", "codex", "gh", "cargo", "bun", "node"].filter((c) => Bun.which(c)).map((c) => `cli:${c}`);
+  const clis = ["claude", "codex", "agy", "gh", "cargo", "bun", "node"].filter((c) => Bun.which(c)).map((c) => `cli:${c}`);
   return [`os:${os}`, `host:${hostName(cfg)}`, `arch:${process.arch}`, ...clis, ...(cfg.host?.caps ?? [])];
 }
 
@@ -251,15 +251,15 @@ export function allowedClis(meta: Record<string, string>, cfg: Cfg): string[] {
   if (meta.cli && meta.cli !== "auto") return [meta.cli];
   const per = cfg.clis?.agents?.[meta.agent || "lead"];
   if (Array.isArray(per) && per.length) return per;
-  if (meta.cli_hint === "claude" || meta.cli_hint === "codex") return [meta.cli_hint];
-  return ["claude", "codex"];
+  if (meta.cli_hint === "claude" || meta.cli_hint === "codex" || meta.cli_hint === "agy") return [meta.cli_hint];
+  return ["claude", "codex", "agy"];
 }
 
 /** What the planner may write back about the CLI: only a `cli_hint`, and only when the task is not pinned and its
  *  agent has no per-member policy — either of those would overrule the suggestion anyway. */
 export function cliHintPatch(meta: Record<string, string>, per: unknown, suggestion: unknown): Record<string, string> {
   const pinned = meta.cli && meta.cli !== "auto";
-  const hint = suggestion === "claude" || suggestion === "codex" ? suggestion : "";
+  const hint = suggestion === "claude" || suggestion === "codex" || suggestion === "agy" ? suggestion : "";
   if (pinned || (Array.isArray(per) && per.length) || !hint) return {};
   return { cli_hint: hint };
 }
