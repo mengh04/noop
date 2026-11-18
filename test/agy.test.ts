@@ -88,6 +88,23 @@ console.log(JSON.stringify({ event: "result", result: { status: "SUCCESS", respo
     const out = await runAgent("agy", "please run tests", join(tmp, "work"), cfg, log);
     expect(out).toContain('"summary":"ran with agy"');
     expect(readFileSync(log, "utf8")).toContain("gemini-4-hydrogen-high");
+
+    // Empty response on ERROR result + AGY_ERROR stderr must preserve the actual error and not parse as PERMISSION_DENIED result
+    const errScript = join(tmp, "fake-agy-err.ts");
+    const errBin = join(tmp, "agy-err");
+    writeFileSync(errScript, `
+console.log(JSON.stringify({ event: "result", result: { status: "ERROR", response: "", error: "Your current account is not eligible in your location." } }));
+console.error('AGY_ERROR: {"short_error":"PERMISSION_DENIED (code 403)","status":"PERMISSION_DENIED","error_code":403}');
+process.exit(3);
+`);
+    writeFileSync(errBin, `#!/bin/sh\nexec ${process.execPath} ${errScript} "$@"\n`);
+    chmodSync(errBin, 0o755);
+    const { parseResult } = await import("../src/runner");
+    const errOut = await runAgent("agy", "test err", join(tmp, "work"), { clis: { agy: { command: [errBin, "-p=", "--input-format", "stream-json", "--output-format", "stream-json"] } } } as unknown as Cfg, log);
+    expect(errOut).toContain("not eligible in your location");
+    const res = parseResult(errOut);
+    expect(res.status).toBe("failed");
+    expect(res.summary).toContain("not eligible in your location");
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

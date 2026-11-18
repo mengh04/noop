@@ -338,7 +338,8 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
       return;
     }
     if (e.event === "result" && e.result) {
-      const text = typeof e.result.response === "string" ? e.result.response
+      const text = typeof e.result.response === "string" && e.result.response
+        ? e.result.response
         : (e.result.status === "ERROR" && typeof e.result.error === "string" ? e.result.error : "");
       if (text) resultText = resultText === undefined ? text : `${resultText}\n\n${text}`;
       return;
@@ -440,10 +441,12 @@ export function parseResult(out: string): Result {
   return { status: "failed", summary: `agent returned no result block. tail: ${out.slice(-300)}` };
 }
 
+const RESULT_STATUSES = new Set<Result["status"]>(["done", "needs_decision", "failed", "delegated", "waiting"]);
+
 function parsed(text: string): Result | null {
   try {
     const r = JSON.parse(text);
-    return r?.status ? r : null;
+    return typeof r?.status === "string" && RESULT_STATUSES.has(r.status) ? r : null;
   } catch { return null; }
 }
 
