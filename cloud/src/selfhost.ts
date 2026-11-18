@@ -123,9 +123,68 @@ function wrapTcpSocket(socket: any, hostname: string) {
 }
 
 let shimsRegistered = false;
+let loadedWorkerModule: Promise<any> | null = null;
+async function loadWorkerModule(): Promise<any> {
+  if (loadedWorkerModule) return loadedWorkerModule;
+  loadedWorkerModule = (async () => {
+    ensureCloudflareShims();
+    const res = await Bun.build({
+      entrypoints: [resolve(import.meta.dir, "index.ts")],
+      target: "bun",
+      plugins: [{
+        name: "noop-selfhost-cloudflare-build-shims",
+        setup(build) {
+          build.onResolve({ filter: /^cloudflare:(workers|email|sockets)$/ }, (args) => ({
+            path: args.path,
+            namespace: "cf-selfhost",
+          }));
+          build.onLoad({ filter: /.*/, namespace: "cf-selfhost" }, (args) => {
+            if (args.path === "cloudflare:workers") {
+              return {
+                loader: "js",
+                contents: `export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }`,
+              };
+            }
+            if (args.path === "cloudflare:email") {
+              return {
+                loader: "js",
+                contents: `export class EmailMessage { constructor(from, to, raw) { this.from = from; this.to = to; this.raw = raw; } }`,
+              };
+            }
+            return {
+              loader: "js",
+              contents: `export function connect(...args) { return globalThis.__noopCfConnect(...args); }`,
+            };
+          });
+        },
+      }],
+    });
+    if (!res.success) {
+      throw new Error(`selfhost build failed: ${res.logs.map((l) => l.message).join("; ")}`);
+    }
+    const js = await res.outputs[0].text();
+    const dataUrl = `data:text/javascript;base64,${Buffer.from(js).toString("base64")}`;
+    return await import(dataUrl);
+  })();
+  return loadedWorkerModule;
+}
+
 function ensureCloudflareShims() {
   if (shimsRegistered) return;
   shimsRegistered = true;
+
+  (globalThis as any).__noopCfConnect = (
+    address: { hostname: string; port: number } | string,
+    opts?: { secureTransport?: string },
+  ) => {
+    const target = typeof address === "string"
+      ? { hostname: address.split(":")[0], port: Number(address.split(":")[1] || 25) }
+      : address;
+    const raw = opts?.secureTransport === "on"
+      ? tlsConnect({ host: target.hostname, port: target.port, servername: target.hostname })
+      : netConnect({ host: target.hostname, port: target.port });
+    return wrapTcpSocket(raw, target.hostname);
+  };
 
   (globalThis as any).WebSocketRequestResponsePair = class WebSocketRequestResponsePair {
     constructor(public request: string, public response: string) {}
@@ -138,44 +197,6 @@ function ensureCloudflareShims() {
       this[1] = new BridgeWebSocket();
     }
   };
-
-  Bun.plugin({
-    name: "noop-selfhost-cloudflare-shims",
-    setup(build) {
-      build.onResolve({ filter: /^cloudflare:(workers|email|sockets)$/ }, (args) => ({
-        path: args.path,
-        namespace: "cf-selfhost",
-      }));
-      build.onLoad({ filter: /.*/, namespace: "cf-selfhost" }, (args) => {
-        if (args.path === "cloudflare:workers") {
-          return {
-            loader: "ts",
-            contents: `export class DurableObject<E = any> { ctx: any; env: E; constructor(ctx: any, env: E) { this.ctx = ctx; this.env = env; } }`,
-          };
-        }
-        if (args.path === "cloudflare:email") {
-          return {
-            loader: "ts",
-            contents: `export class EmailMessage { constructor(public from: string, public to: string, public raw: string) {} }`,
-          };
-        }
-        return {
-          loader: "object",
-          exports: {
-            connect(address: { hostname: string; port: number } | string, opts?: { secureTransport?: string }) {
-              const target = typeof address === "string"
-                ? { hostname: address.split(":")[0], port: Number(address.split(":")[1] || 25) }
-                : address;
-              const raw = opts?.secureTransport === "on"
-                ? tlsConnect({ host: target.hostname, port: target.port, servername: target.hostname })
-                : netConnect({ host: target.hostname, port: target.port });
-              return wrapTcpSocket(raw, target.hostname);
-            },
-          },
-        };
-      });
-    },
-  });
 }
 
 function hasMultipleStatements(sql: string): boolean {
@@ -361,9 +382,7 @@ function readTokenFromConfig(): string {
 }
 
 export async function startSelfHostServer(opts: SelfHostOptions = {}): Promise<SelfHostHandle> {
-  ensureCloudflareShims();
-  const workerModule = "./index";
-  const { default: worker, Hub } = await import(workerModule) as any;
+  const { default: worker, Hub } = await loadWorkerModule();
 
   const port = opts.port ?? Number(process.env.HUB_PORT || process.env.PORT || 8788);
   const host = opts.host ?? process.env.HUB_HOST ?? process.env.HOST ?? "0.0.0.0";
